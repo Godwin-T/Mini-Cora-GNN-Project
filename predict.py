@@ -5,7 +5,25 @@ import pickle
 from torch.nn import Linear
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
+from torch_geometric.data import Data
 
+
+def data_prep(citation_path, paper_path):
+
+    # Loading citation data
+    citations_data = pd.read_csv(citation_path,
+                                    sep="\t",
+                                    header=None,
+                                    names=["target", "source"],
+                                    )
+    # Loading papers data
+    column_names = ["paper_id"] + [f"term_{idx}" for idx in range(1433)] + ["subject"]
+    papers_data = pd.read_csv(paper_path, 
+                                sep="\t", 
+                                header=None, 
+                                names=column_names,)
+    papers_data = papers_data.sort_values('paper_id', ascending=True)
+    return papers_data, citations_data
 
 class GCN(torch.nn.Module):
 
@@ -32,63 +50,87 @@ class GCN(torch.nn.Module):
         # Output layer 
         x = F.log_softmax(self.out(x), dim=1)
         return x
+    
+def value_mapping(papers_data, citations_data):
 
-model = torch.load('./model.pth')
-with open('data.pkl', 'rb') as f:
-    data, class_idc = pickle.load(f)
+    # Class mapping i
+    class_values = sorted(papers_data["subject"].unique())
+    class_idc = {name: id for id, name in enumerate(class_values)}
 
-paper_path = './cora.content'
-column_names = ["paper_id"] + [f"term_{idx}" for idx in range(1433)] + ["subject"]
-papers_data = pd.read_csv(paper_path, 
-                            sep="\t", 
-                            header=None, 
-                            names=column_names,)
-papers_data = papers_data.sort_values('paper_id', ascending=True)
+    # Paper Id mapping
+    paperid_values = sorted(papers_data["paper_id"].unique())
+    paper_idc = {name: idx for idx, name in enumerate(paperid_values)}
 
-def infrence(papers_data):
-    ''''For making infrence on new data'''
-    train_data, test_data = [], []
-    for _, group in papers_data.groupby("subject"):
-        # Select around 50% of the dataset for training.
-        random_selection = np.random.rand(len(group.index)) <= 0.8
-        train_data.append(group[random_selection])
-        test_data.append(group[~random_selection])
+    papers_data["paper_id"] = papers_data["paper_id"].apply(lambda name: paper_idc[name])
+    citations_data["source"] = citations_data["source"].apply(lambda name: paper_idc[name])
+    citations_data["target"] = citations_data["target"].apply(lambda name: paper_idc[name])
+    papers_data["subject"] = papers_data["subject"].apply(lambda value: class_idc[value])
 
-    train_data = pd.concat(train_data).sample(frac=1)
-    test_data = pd.concat(test_data).sample(frac=1)
+    mappings = (class_idc, paper_idc)
 
-    # get node feature names
-    feature_names = set(papers_data.columns) - {"paper_id", "subject"}
+    return papers_data, citations_data, mappings
 
-    # create node features array [num_nodes, num_features].
-    node_features = test_data[feature_names].to_numpy()
+def batch_prediction(model, graph_data, citation_data,  data):
+
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model.eval()
+
+    feature_names = set(data.columns) - {"paper_id", "subject"}
+    node_features = data[feature_names].to_numpy()
     node_features = torch.from_numpy(node_features).type(torch.FloatTensor)
-    return node_features,test_data
 
-def get_keys(d, value):
+    new_lab = []
+    for i in range(node_features.shape[0]):
+
+        new_data_feats = node_features[i].unsqueeze(0)
+
+        target_ = citation_data[citation_data['target']==i] 
+        edge = torch.from_numpy(target_.to_numpy()).T
+
+        x = torch.cat((graph_data.x, new_data_feats), dim = 0)
+        new_graph_edge = torch.cat((graph_data.edge_index, edge), dim = 1)
+
+        new_graph_data = Data(x= x, edge_index = new_graph_edge)
+        new_graph_data = new_graph_data.to(device)
+
+        #out = model(x,new_graph_edge)
+        out = model(new_graph_data.x, new_graph_data.edge_index)
+        pred = out.argmax(dim=1)  
+        new_lab.append(pred[-1])
+    return new_lab
+
+def single_prediction(model, graph_data, data, new_edges):
+
+    model.eval()
     
-    for k, v in d.items():
-        if v == value:
-            return k
+    node_features = torch.from_numpy(data).type(torch.FloatTensor)
+    node_features = node_features.unsqueeze(0)
 
-model.eval()
-node_features, test_data = infrence(papers_data)
+    x = torch.cat((graph_data.x, node_features), dim = 0)
+    new_edge = torch.cat((graph_data.edge_index, new_edges), dim = 1)
 
-new_lab = []
-for i in range(node_features.shape[0]):
-    
-    paper_index = test_data.iloc[0]['paper_id']
-    new_data_feats = node_features[i].unsqueeze(0)
-    x = torch.cat((data.x, new_data_feats), dim = 0)
-    out = model(x,data.edge_index)
-    pred = out.argmax(dim=1)  
-    new_lab.append(pred[-1])
-    print(f'The paper with index id {paper_index} is classified as a {get_keys(class_idc, pred[-1])} paper')
+    out = model(x,new_edge)
+    pred = out.argmax(dim=1)[-1]
+    return pred
 
 
+citation_path = './cora.cites'
+paper_path = './cora.content'
 
-# lab = test_data['subject'].values.tolist()
-# new_lab, lab = np.array(new_lab), np.array(lab)
-# corr = (new_lab == lab).sum()
-# corr/node_features.shape[0]
+model = torch.load('model.pth')
+with open('data.pkl', 'rb') as f:
+    graph_data = pickle.load(f)
 
+papers_data, citations_data = data_prep(citation_path, paper_path)
+papers_data, citations_data, mappings = value_mapping(papers_data, citations_data)
+
+out = batch_prediction(model, graph_data, citations_data, papers_data)
+lab = papers_data['subject'].values.tolist()
+new_lab, lab = np.array(out), np.array(lab)
+corr = (new_lab == lab).sum()
+print('Prediction Acc' ,corr/papers_data.shape[0])
+
+ori = np.array(graph_data.y)
+corr = (new_lab == ori).sum()
+print('Actual Acc' ,corr/papers_data.shape[0])

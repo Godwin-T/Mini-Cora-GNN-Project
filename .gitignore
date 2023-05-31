@@ -1,3 +1,8 @@
 data/
+
+.gitignore
+*.cites
+*.content
+
 *.pth
 *.pkl

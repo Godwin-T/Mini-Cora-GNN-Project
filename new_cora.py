@@ -1,5 +1,3 @@
-# Importing Libraries
-print('Importing Libraries')
 import pandas as pd
 import numpy as np
 import torch
@@ -12,19 +10,12 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 from torch_geometric.datasets import Planetoid
 from torch_geometric.data import Data
-import pickle
 
-# Load data
 dataset = Planetoid(root='data/Cora', name='Cora')
 data = dataset[0]
 
-citation_path = './cora.cites'
-paper_path = './cora.content'
-
-
-
 def data_prep(citation_path, paper_path):
-    
+
     # Loading citation data
     citations_data = pd.read_csv(citation_path,
                                     sep="\t",
@@ -39,7 +30,6 @@ def data_prep(citation_path, paper_path):
                                 names=column_names,)
     papers_data = papers_data.sort_values('paper_id', ascending=True)
     return papers_data, citations_data
-
 
 def value_mapping(papers_data, citations_data):
 
@@ -60,14 +50,15 @@ def value_mapping(papers_data, citations_data):
 
     return papers_data, citations_data, mappings
 
-
 def extract_features(papers_data, citations_data):
     
     # get node feature names
     feature_names = set(papers_data.columns) - {"paper_id", "subject"}
 
     # create edges array [2, num_edges].
-    edges = citations_data[["source", "target"]].to_numpy().T
+    st_edges = citations_data[["source", "target"]].to_numpy().T
+    ts_edges = citations_data[["target", "source"]].to_numpy().T
+    edges = np.concatenate([st_edges, ts_edges], axis=1)
     edge_index = torch.from_numpy(edges).to(torch.long)
 
     # create node features array [num_nodes, num_features].
@@ -78,10 +69,10 @@ def extract_features(papers_data, citations_data):
     # create graph data
     data = Data(x=node_features, edge_index = edge_index, y=labels)
 
+    # print("Edges shape:", edges.shape)
+    #print("Nodes shape:", node_features.shape)
     return data
 
-
-# Define model
 class GCN(torch.nn.Module):
 
     def __init__(self, input_feats, hidden_channels, out_channels):
@@ -107,9 +98,7 @@ class GCN(torch.nn.Module):
         # Output layer 
         x = F.log_softmax(self.out(x), dim=1)
         return x
-
-
-
+    
 def train(utils, new_data):
 
       model, optimizer, criterion = utils
@@ -151,113 +140,161 @@ def val(model, new_data):
       test_acc = int(test_correct.sum()) / int(data.val_mask.sum())  
       return test_acc
 
-
 def get_keys(d, value):
-    '''For mapping predicted values to their keys'''
+    
     for k, v in d.items():
         if v == value:
             return k
 
+def new_input(new_node, citation, new_data, ):
 
-def new_input(new_node, citation):
-    '''For preparing new data'''
     x = torch.cat((new_data.x, new_node), dim = 0)
     context_edges = citation.to_numpy()
-    context_edges = torch.from_numpy(context_edges).to(torch.long).T
+    context_edges = torch.from_numpy(new_citation).to(torch.long).T
     x_index = torch.cat((new_data.edge_index, context_edges), dim = 1)
     return x, x_index
 
-print('Loading Data')
-papers_data, citations_data = data_prep(citation_path, paper_path)
-papers_data, citations_data, mappings = value_mapping(papers_data, citations_data)
-print('Feature Extraction')
-new_data = extract_features(papers_data, citations_data)
-class_idc, paper_idc = mappings
+def infrence(papers_data):
+    train_data, test_data = [], []
+    for _, group in papers_data.groupby("subject"):
+        # Select around 50% of the dataset for training.
+        random_selection = np.random.rand(len(group.index)) <= 0.8
+        train_data.append(group[random_selection])
+        test_data.append(group[~random_selection])
 
+    train_data = pd.concat(train_data).sample(frac=1)
+    test_data = pd.concat(test_data).sample(frac=1)
 
-class CRD(torch.nn.Module):
-    def __init__(self, d_in, d_out, p):
-        super(CRD, self).__init__()
-        self.conv = GCNConv(d_in, d_out, cached=True) 
-        self.p = p
+    # get node feature names
+    feature_names = set(papers_data.columns) - {"paper_id", "subject"}
 
-    def reset_parameters(self):
-        self.conv.reset_parameters()
+    # create node features array [num_nodes, num_features].
+    node_features = test_data[feature_names].to_numpy()
+    node_features = torch.from_numpy(node_features).type(torch.FloatTensor)
+    return node_features,test_data
 
-    def forward(self, x, edge_index, mask=None):
-        x = F.relu(self.conv(x, edge_index))
-        x = F.dropout(x, p=self.p, training=self.training)
-        return x
-
-class CLS(torch.nn.Module):
-    def __init__(self, d_in, d_out):
-        super(CLS, self).__init__()
-        self.conv = GCNConv(d_in, d_out, cached=True)
-
-    def reset_parameters(self):
-        self.conv.reset_parameters()
-
-    def forward(self, x, edge_index, mask=None):
-        x = self.conv(x, edge_index)
-        x = F.log_softmax(x, dim=1)
-        return x
-    
-class Net(torch.nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-        self.crd = CRD(1433, 64, 0.5)
-        self.cls = CLS(64, 7)
-
-    def reset_parameters(self):
-        self.crd.reset_parameters()
-        self.cls.reset_parameters()
-
-    def forward(self, data):
-        x, edge_index = data.x, data.edge_index
-        x = self.crd(x, edge_index)
-        x = self.cls(x, edge_index)
-        return x
-
-print('Initializing  model Parameters')
+citation_path = './cora.cites'
+paper_path = './cora.content'
 # Initialize model
-input_feats = new_data.x.shape[1]
-hidden_channels = 64
+input_feats = 1433 #new_data.x.shape[1]
 out_channels = 7
-
-model = GCN(input_feats, hidden_channels, out_channels)
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") # Use GPU
-model = model.to(device)
-new_data = new_data.to(device)
 
 # Initialize Optimizer
 learning_rate = 0.01
 decay = 5e-4
-optimizer = torch.optim.Adam(model.parameters(), 
-                             lr=learning_rate, 
-                             weight_decay=decay)
 
-# Define loss function (CrossEntropyLoss for Classification Problems with 
-# probability distributions)
-criterion = torch.nn.CrossEntropyLoss()
+def final_train(citation_path, paper_path, 
+                input_feats = 1433, hidden_channels = 16,
+                out_channels = 7, learning_rate = 0.01,
+                decay = 5e-4, epochs = 1001):
 
-utils = (model, optimizer, criterion)
+    papers_data, citations_data = data_prep(citation_path, paper_path)
+    papers_data, citations_data, mappings = value_mapping(papers_data, citations_data)
+    new_data = extract_features(papers_data, citations_data)
+    class_idc, paper_idc = mappings
 
-print('Model training')
-losses = []
-for epoch in range(0, 1001):
-    loss, acc = train(utils, new_data)
-    losses.append(loss)
-    if epoch % 100 == 0:
-      print(f'Epoch: {epoch:03d}, Loss: {loss:.4f} Accuracy: {acc:.4f}')
+    
 
-print('=========================================================================================')
+    model = GCN(input_feats, hidden_channels, out_channels)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") # Use GPU
+    model = model.to(device)
+    new_data = new_data.to(device)
 
+    
+    optimizer = torch.optim.Adam(model.parameters(), 
+                                lr=learning_rate, 
+                                weight_decay=decay)
 
-test_acc = test(model, new_data)
-val_acc = val(model, new_data)
+    # Define loss function (CrossEntropyLoss for Classification Problems with 
+    # probability distributions)
+    criterion = torch.nn.CrossEntropyLoss()
+    utils = (model, optimizer, criterion)
 
-print(f'Test Accuracy: {test_acc:.4f}')
-print(f'Validation Accuracy: {val_acc:.4f}')
+    losses = []
+    for epoch in range(0, epochs):
+        loss, acc = train(utils, new_data)
+        losses.append(loss)
+        #if epoch % 100 == 0:
+            #print(f'Epoch: {epoch:03d}, Loss: {loss:.4f} Accuracy: {acc:.4f}')
+
+    test_acc = test(model, new_data)
+    print(f'Test Accuracy: {test_acc:.4f}')
+
+    val_acc = val(model, new_data)
+    print(f'Validation Accuracy: {val_acc:.4f}')
+    return model, papers_data, citations_data, new_data, class_idc
+
+model, papers_data, citation_data, new_data, class_idc = final_train(citation_path, paper_path)
+
+feature_names = set(papers_data.columns) - {"paper_id", "subject"}
+lab = papers_data['subject'].values.tolist()
+
+# create node features array [num_nodes, num_features].
+node_features = papers_data[feature_names].to_numpy()
+node_features = torch.from_numpy(node_features).type(torch.FloatTensor)
+
 torch.save(model, 'model.pth')
-with open('data.pkl', 'wb') as f:
-    pickle.dump((new_data, class_idc), f)
+print('Model Saved')
+
+model.eval()
+
+new_lab = []
+for i in range(node_features.shape[0]):
+    
+    new_data_feats = node_features[i].unsqueeze(0)
+
+    target_ = citation_data[citation_data['target']==i] 
+    edge = torch.from_numpy(target_.to_numpy()).T
+
+    x = torch.cat((new_data.x, new_data_feats), dim = 0)
+    new_edge = torch.cat((new_data.edge_index, edge), dim = 1)
+
+    out = model(x,new_edge)
+    pred = out.argmax(dim=1)  
+    new_lab.append(pred[-1])
+
+
+new_lab, lab = np.array(new_lab), np.array(lab)
+corr = (new_lab == lab).sum()
+print(corr/node_features.shape[0])
+
+def batch_prediction(model, graph_data, citation_data,  data):
+
+
+    model.eval()
+
+    feature_names = set(data.columns) - {"paper_id", "subject"}
+
+    # create node features array [num_nodes, num_features].
+    node_features = data[feature_names].to_numpy()
+    node_features = torch.from_numpy(node_features).type(torch.FloatTensor)
+
+    new_lab = []
+    for i in range(node_features.shape[0]):
+
+        new_data_feats = node_features[i].unsqueeze(0)
+
+        target_ = citation_data[citation_data['target']==i] 
+        edge = torch.from_numpy(target_.to_numpy()).T
+
+        x = torch.cat((graph_data.x, new_data_feats), dim = 0)
+        new_edge = torch.cat((graph_data.edge_index, edge), dim = 1)
+
+        out = model(x,new_edge)
+        pred = out.argmax(dim=1)  
+        new_lab.append(pred[-1])
+    return new_lab
+
+citation_path = './cora.cites'
+paper_path = './cora.content'
+
+model = torch.load('./model.pth')
+
+papers_data, citations_data = data_prep(citation_path, paper_path)
+papers_data, citations_data, mappings = value_mapping(papers_data, citations_data)
+
+out = batch_prediction(model, new_data, citations_data, papers_data,)
+lab = papers_data['subject'].values.tolist()
+new_lab, lab = np.array(out), np.array(lab)
+corr = (new_lab == lab).sum()
+print(corr/papers_data.shape[0])
